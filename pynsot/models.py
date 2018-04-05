@@ -438,14 +438,88 @@ class Resource(collections.MutableMapping):
 # THIS IS NOT WORKING YET
 class ResourceList(collections.MutableSequence):
     """A list of Resource objects that supports bulk operations."""
-    def __init__(self, objects, **kwargs):
-        self.objects = objects
+    def __init__(self, iterator, **kwargs):
+        self.iterator = iterator
+
+        self._obj_cache = []
 
     def __iter__(self):
-        return self.objects.next()
+        for item in self._obj_cache:
+            yield item
 
-    @classmethod
-    def filter(cls, **fields):
+        for item in self.iterator:
+            self._obj_cache.append(item)
+            yield item
+
+    def __getitem__(self, index):
+        self._advance_iter(index)
+        return self._obj_cache[index]
+
+    def __setitem__(self, index, value):
+        self._advance_iter(index)
+        self._obj_cache[index] = value
+
+    def __delitem__(self, index):
+        self._advance_iter(index)
+        del self.obj_cache[index]
+
+    def __len__(self):
+        list(self.__iter__())   # Forcibly exhaust the iterator
+        return len(self._obj_cache)
+
+    def _advance_iter(self, index):
+        """
+        Ensure that the internal iterator has been advanced to at least
+        position ``index`` and that we have that position stored in
+        ``_obj_cache``.
+
+        This is used in operations that happen at a particular index, like
+        getitem, setitem, etc.
+
+        :raises: IndexError if ``index`` is beyond the end of the iterator
+        """
+        last_idx = len(self._obj_cache)) - 1
+
+        # If we already have this index stored, we're done
+        if last_idx >= index:
+            return
+
+        # Through the iterator, storing items in our cache until we reach
+        # the desired index
+        for item in self.iterator:
+            self._obj_cache.append(item)
+            if last_idx == index:
+                return
+
+        # If we burned through the iterator and we still don't have that index,
+        # raise an IndexError since it's past the end of the iterator
+        if last_idx < index:
+            raise IndexError('list index out of range')
+
+    def filter(self, **fields):
+        """
+        Returns a new ResourceList that is a subset of this ResourceList with
+        fields that match the given keyword arguments.
+        """
+        def matches(obj):
+            for k, v in fields.iteritems():
+                if k == 'attributes':
+                    continue
+                if obj[k] != v:
+                    return False
+            return True
+
+        return ResourceList(itertools.ifilter(matches, self))
+
+    def set_query(self, query):
+        """
+        Returns a new ResourceList that is a subset of this ResourceList,
+        filtered based on attributes that match the given set query string
+        """
+        # NOTE(npegg): Boy this seems like a doozy to do. I don't really want
+        #              to reimplement this since the server already does this
+        #              for us. It would be handy if that set_query logic were
+        #              split out into a common nsot-utils lib
         pass
 
     @classmethod
@@ -453,13 +527,16 @@ class ResourceList(collections.MutableSequence):
         pass
 
     def update(self, overwrite=False, **kwargs):
-        pass
+        return NotImplementedError
+
+    def save(self):
+        return NotImplementedError
 
     def delete(self, **kwargs):
-        pass
+        return NotImplementedError
 
     def exists(self):
-        return all(o.existing_object() for o in self.objects)
+        return all(o.existing_object() for o in self)
 
 
 # NYI - Exclude these for now.
