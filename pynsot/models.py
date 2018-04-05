@@ -1,685 +1,858 @@
 # -*- coding: utf-8 -*-
 
-'''API Model Classes
+"""
+API Model Classes
 
 These resource models are derrived from collections.MutableMapping and, thus,
 act like dicts and can instantiate with raw resource output from API as well as
 simplifying by providing site_id and (usually) the natural key (cidr, hostname,
 etc).
-
-Example
--------
-
->>> from pynsot.models import Network, Device, Interface
->>> from pynsot.client import get_api_client
->>> client = get_api_client()
->>> net = Network(raw=client.networks.get()[-1])
->>>
->>> # Or also...
->>> # >>> net = Network(client=client, site_id=1, cidr='8.8.8.0/24')
->>>
->>> net.exists()
->>> True
->>>
->>> net.existing_resource()
-{u'attributes': {},
- u'id': 81,
- u'ip_version': u'4',
- u'is_ip': False,
- u'network_address': u'254.0.0.0',
- u'parent_id': 1,
- u'prefix_length': 24,
- u'site_id': 1,
- u'state': u'allocated'}
->>>
->>> net.purge()
-True
->>>
->>> net.exists()
-False
->>>
->>> net.ensure()
-True
->>>
->>> net.exists()
-True
->>>
->>> net['site_id']
-2
->>>
->>> net['site_id'] = 4
->>>
->>> net.exists()
-False
->>>
->>> net['site_id'] = 2
->>>
->>> net.exists()
-True
-'''
+"""
 
 from __future__ import unicode_literals
-import logging
+import abc
 import collections
-from abc import abstractproperty, abstractmethod, ABCMeta
-from netaddr import IPNetwork
-from pynsot.util import get_result
+import copy
+import urlparse
+
+import coreapi
+from pynsot.vendor.slumber.exceptions import HttpClientError, HttpServerError
 from pynsot.client import get_api_client
+
+from .exc import NsotHttpError, DoesNotExist
+
+
+# Default limit of how many Resource objects at a time to ask for
+PAGE_LIMIT = 100
+
+
+def deep_merge(dict_a, dict_b):
+    """
+    Return a new dict that is dict_b deeply merged into dict_a, meaning any
+    nested dicts will also be deeply merged. This is different from the
+    standard "shallow" merge where any nested dicts in dict_b simply overwrite
+    nested dicts in dict_a.
+
+    :param dict_a:
+        The dict to be merged in to
+
+    :param dict_b:
+        The dict to merge into dict_a
+
+    :returns:
+        A copy of dict_a with dict_b merged into it
+    """
+    dict_a = copy.deepcopy(dict_a)
+
+    for key, b_val in dict_b.iteritems():
+        a_val = dict_a.get(key)
+
+        if isinstance(a_val, dict) and isinstance(b_val, dict):
+            dict_a[key] = deep_merge(a_val, b_val)
+        else:
+            dict_a[key] = b_val
+
+    return dict_a
+
+
+##jathan
+# FIXME(jathan): If we want to keep using this, move it to a util function (or
+# nsot-utils?)
+# Forklifted from ``drf_yasg.utils.filter_none()``
+def filter_none(obj):
+    """Remove ``None`` values from tuples, lists or dictionaries. Return other objects as-is.
+
+    :param obj:
+    :return: collection with ``None`` values removed
+    """
+    if obj is None:
+        return None
+    new_obj = None
+    if isinstance(obj, dict):
+        new_obj = type(obj)((k, v) for k, v in obj.items() if k is not None and v is not None)
+    if isinstance(obj, (list, tuple)):
+        new_obj = type(obj)(v for v in obj if v is not None)
+    if new_obj is not None and len(new_obj) != len(obj):
+        return new_obj  # pragma: no cover
+    return obj
+##jathan
 
 
 class Resource(collections.MutableMapping):
-    '''Base API Abstraction Models Class
+    """
+    Represents a base NSoT Resource, all other NSoT classes inherit off of this
 
-    Instances of an API abstraction model represent a single NSoT resource and
-    provide methods for managing the state of it upstream. They can be
-    instantiated by the raw returned object from NSoT API or more simply by a
-    few descriptive kwargs.
+    Child classes of this class must set a resource which matches the part of
+    the API URL that is relevant. Example:
+    Device -> /api/devices/ -> resource_name = 'devices'
+    """
+    __metaclass__ = abc.ABCMeta
 
-    Resource is a subclass of :class:``collections.MutableMapping`` which makes
-    it act as a dictionary would. The mapping represents the payload that would
-    be accepted by NSoT and can be manipulated as desired like a normal dict.
+    # fields needs to exist here before __init__ is called because of our use
+    # of __getattr__/__setattr__. Without this we end up falling into an
+    # infinite recursion
+    fields = []
 
-    Subclassing:
-        Subclasses must adhere to a simple contract:
-            * Overload the abstractmethods and abstractproperties this class
-              uses
-            * If custom arguments are needed, overload ``self.postinit``.
-              Just make sure to call ``self.init_payload()`` at the end. All
-              kwargs that aren't handled by ``self.__init__`` are passed here
+    def __init__(self, nsot_client=None, **kwargs):
+        # If a nsot client is passed in, use that. Otherwise try looking it up
+        # from the class object, or fail gloriously.
+        self.nsot_client = self.nsot_client or nsot_client
+        if not self.nsot_client:
+            raise RuntimeError((
+                "You must either call models.init() or supply a "
+                "nsot_client to this class"
+           ))
 
-    :param site_id: Site ID this reseource belongs to. Required unless ``raw``
-        is supplied.
-    :type site_id: int
-    :param attributes: Attributes to add to resource. If supplying ``raw``, add
-        these after the instantiation like:
+        self.initialize_object(obj=kwargs)
 
-            >>> obj = Device(raw=RAW_API_DICT)
-            >>> obj['attributes'] = {}
+    def initialize_object(self, obj=None):
+        """
+        Figure out what fields exist should exist on this model, set those
+        on the internal object representation. If the passed-in obj has that
+        key, use it, otherwise default to None.
+        """
+        self.obj = {}
 
-    :type attributes: dict
-    :param client: Pynsot client for API interactions. Will be lazily loaded if
-        not provided, but might be cheaper to supply it up front.
-    :type client: pynsot.client.BaseClient
-    :param raw: Raw NSoT resource object. What would be returned from a GET,
-        POST, PUT, or PATCH operation for a single resource. Gets mapped
-        directly to payload
-    :type raw: dict
-    '''
-
-    __metaclass__ = ABCMeta
-
-    def __init__(
-        self,
-        site_id=None,
-        client=None,
-        raw=None,
-        attributes=None,
-        **kwargs
-    ):
-        if raw is None:
-            raw = {}
-        if attributes is None:
-            attributes = {}
-
-        self.logger = logging.getLogger(__name__)
-        self.errors = []
-        self.last_error = None
-        # Placeholder for .existing_resource() state
-        self._existing_resource = {}
-        self._payload = {}
-        # Parameter validations
-
-        # Site ID is required but can come from either kwarg or raw resource
-        # dict, latter being preferred.
-        if raw.get('site_id'):
-            site_id = raw['site_id']
-        elif site_id:
-            pass  # Already set
+        if obj is None:
+            obj = {}
         else:
-            raise TypeError(
-                'Resource requires site_id via param or ``raw`` key'
-            )
+            # Get a deep copy to protect against external modifications
+            obj = copy.deepcopy(obj)
 
-        self._site_id = site_id
-        self.client = client
-        self.raw = raw
-        self.attributes = attributes
+        for field in self.fields:
+            # FIXME(jathan): We need to stop assuming that clients will be
+            # site-scoped.
+            if field == 'site_id':
+                # For now, skip ``site_id`` since a ModelClient.nsot_client
+                # object is always scoped to a site
+                continue
 
-        if not self.raw:
-            self.postinit(**kwargs)
+            default = None
+            if field == 'attributes':
+                default = {}
+
+            self.obj[field] = obj.get(field, default)
+
+    @classmethod
+    def from_dict(cls, obj):
+        """
+        Given a dict, return an instance.
+
+        :param obj:
+            Dictionary representation of an object
+
+        :returns:
+            Resource instance
+        """
+        return cls(**obj)
+
+    # Dict-like access methods
+    def __getitem__(self, key):
+        return self.obj[key]
+
+    def __setitem__(self, key, value):
+        self.obj[key] = value
+
+    def __delitem__(self, key):
+        del self.obj[key]
+
+    def __iter__(self):
+        return iter(self.obj)
+
+    def __len__(self):
+        return len(self.obj)
+
+    # Attribute access methods
+    def __getattr__(self, attr):
+        try:
+            return self.obj[attr]
+        except KeyError:
+            raise AttributeError("'{}' object has no attribute '{}'".format(
+                self.__class__, attr
+            ))
+
+    def __setattr__(self, attr, val):
+        """
+        If an attribute is set that exists in our list of NSoT model fields,
+        save it to the internal dict. Otherwise save it to the object itself.
+        """
+        if attr in self.fields:
+            self.obj[attr] = val
         else:
-            # This is done here because subclases do this in their postinit().
-            # If raw is passed, there's no reason to go through the postinit
-            # process which takes things like network_address, hostname, etc.
-            #
-            # Every subclasses init_payload method has a condition for 'if raw
-            # set raw' basically.
-            self.init_payload()
+            self.__dict__[attr] = val
 
-    def postinit(self, **kwargs):
-        '''Overloadable method for post __init__
+    def __repr__(self):
+        natural_key = getattr(self, self.natural_key)
+        return '<{}: {}>'.format(self.__class__.__name__, natural_key)
 
-        Use this for things that need to happen post-init, including
-        subclass-specific argument handling.
-
-        This method is called at the very end of __init__ unless ``raw`` is
-        given.
-
-        :params kwargs: All unhandled kwargs from __init__ are passed here
-        :type kwargs: dict
-        '''
-        # If not being overloaded by subclass, still need to call this required
-        # method if ``raw`` isn't provided
-        self.init_payload()
-        pass
-
-    def ensure_client(self, **kwargs):
-        '''Ensure that object has a client object
-
-        Client may be passed during __init__ as a kwarg, but call this before
-        doing any client work to ensure
-
-        :param kwargs: These will be passed to get_api_client.
-        :type kwargs: dict
-        '''
-        if self.client:
-            return
-        else:
-            self.client = get_api_client(**kwargs)
-
-    @abstractproperty
-    def identifier(self):
-        '''Human-friendly string to represent the resource
-
-        Used in log messages and magic methods for comparison. Examples here
-        would be CIDR, hostname, etc
-
-        :rtype: str
-        '''
+    @abc.abstractproperty
+    def resource_name(self):
         pass
 
     @property
     def resource(self):
-        '''Pynsot client for resource type
+        """
+        Returns the slumber resource to access this NSoT resource
+        """
+        return getattr(self.nsot_client, self.resource_name)
 
-        :rtype: pynsot.client.BaseClient
-        '''
-        self.ensure_client()
-        return getattr(self.client, self.resource_name)
+    def _call_method(self, resource, method_name, *args, **kwargs):
+        """
+        Calls the given method on the given resource. This exists to provide a
+        central location to do handling of common errors that come from these
+        responses.
 
-    @abstractproperty
-    def resource_name(self):
-        '''Name of resource
+        :param method_name:
+            String representation of the method to use, e.g. 'get', 'put'
 
-        Must be plural
+        :returns:
+            Returns the payload from the method call
+        """
+        method = getattr(resource, method_name.lower())
 
-        :rtype: str
-        '''
-        pass
-
-    @abstractmethod
-    def init_payload(self):
-        '''
-        Initializes the payload dictionary using resource specific data
-        '''
-        pass
-
-    @property
-    def payload(self):
-        '''Represents exact payload sent to NSoT server
-
-        :returns: _payload
-        :rtype: dict
-        '''
-        return self._payload
-
-    @payload.setter
-    def payload(self, value):
-        '''Setter for payload'''
-        self._payload = value
-
-    def __iter__(self):
-        '''Iterate through payload keys'''
-        return iter(self.payload)
-
-    def __getitem__(self, key):
-        '''Get item from payload'''
-        return self.payload[key]
-
-    def __setitem__(self, key, value):
-        '''Set item in payload
-
-        Cache is cleared here since the current resource has changed
-        '''
-        self.clear_cache()
-        self.payload[key] = value
-
-    def __delitem__(self, key):
-        '''Delete item from payload
-
-        Cache is cleared here since the current resource has changed
-        '''
-        self.clear_cache()
-        del self.payload[key]
-
-    def __len__(self):
-        return len(self._payload)
-
-    def __repr__(self):
-        '''Human-friendly representation'''
-        title = self.resource_name[:-1].title()
-        return '<%s: %s>' % (title, str(self))
-
-    def __str__(self):
-        return str(self.identifier)
-
-    def __eq__(self, other):
-        '''Using ``identifier`` and ``site_id``, compare to another resource'''
         try:
-            x = '%s:%s' % (self.identifier, self._site_id)
-            y = '%s:%s' % (other.identifier, other._site_id)
-            return x == y
-        except:
-            raise TypeError('Other object is not a Resource type')
+            return method(*args, **kwargs)
+        except (HttpClientError, HttpServerError) as e:
+            self.handle_method_error(e, method_name, (args, kwargs))
 
-    def log_error(self, error):
-        '''Log and append errors to object
+    def handle_method_error(self, err, method_name, args):
+        try:
+            msg = err.response.json()['error']['message']
+        except ValueError:
+            msg = err.response.text
 
-        This does a check to see if response object available from HTTP
-        request. If not, that's OK too and it'll just append the raw error.
-        '''
-        if hasattr(error, 'response') and hasattr(error.response, 'json'):
-            try:
-                meta = error.response.json()
-            except:
-                meta = error.response
+        # If it's a 404 raise DoesNotExist...
+        if err.response.status_code == 404:
+            exc_class = DoesNotExist
         else:
-            meta = error
+            exc_class = NsotHttpError
 
-        self.logger.debug(
-            '[%s] %s' % (self.identifier, meta),
-            exc_info=True,
+        raise exc_class(
+            'Unable to perform {} on object with args {}: {}'.format(
+                method_name,
+                args,
+                msg
+            ),
+            response=err.response
         )
-        self.logger.warning(
-            '[%s] %s' % (self.identifier, meta),
-        )
-        self.errors.append(meta)
-        self.last_error = meta
 
-    def existing_resource(self):
-        '''Returns upstream resource
+    @classmethod
+    def get(cls, pk):
+        """
+        Fetch the object from NSoT by it's primary key or natural key (if
+        supported) and return the Resource object that wraps the NSoT object
 
-        If nothing exists, empty dict is returned. The result of this is cached
-        in a property (_existing_resource) for cheaper re-checks. This can be
-        cleared via ``.clear_cache()``
+        """
+        r = cls()
+        item = r._call_method(r.resource(pk), 'get')
+        return cls(**item)
 
-        :rtype: dict
-        '''
-        self.ensure_client()
-        if self._existing_resource:
-            return self._existing_resource
+    @classmethod
+    def filter(cls, **fields):
+        """
+        Fetch object(s) from NSoT that have fields that match the given keyword
+        args, similar to Django's `filter` method on models.
+
+        :returns:
+            A generator of Resource objects representing the results
+        """
+        fields = copy.deepcopy(fields)
+        # Remove attributes since we can't filter on those
+        if 'attributes' in fields.keys():
+            del fields['attributes']
+
+        r = cls()
+
+        offset = 0
+        items = r._call_method(r.resource, 'get', limit=PAGE_LIMIT,
+                               offset=offset, **fields)['results']
+        while len(items) > 0:
+            for item in items:
+                yield cls(**item)
+
+            offset += PAGE_LIMIT
+            items = r._call_method(r.resource, 'get', limit=PAGE_LIMIT,
+                                   offset=offset, **fields)['results']
+
+    @classmethod
+    def set_query(cls, query, **fields):
+        """
+        Performs a set query on the resource and returns a list of class
+        instances of objects that match that query
+
+        :returns:
+            A generator of Resource objects representing the results
+        """
+        r = cls()
+        fields = copy.deepcopy(fields)
+        fields['query'] = query
+
+        # Remove attributes since we can't filter on those
+        if 'attributes' in fields.keys():
+            del fields['attributes']
+
+        offset = 0
+        items = r._call_method(r.resource.query, 'get', limit=PAGE_LIMIT,
+                               offset=offset, **fields)['results']
+        while len(items) > 0:
+            for item in items:
+                yield cls(**item)
+
+            offset += PAGE_LIMIT
+            items = r._call_method(r.resource.query, 'get', limit=PAGE_LIMIT,
+                                   offset=offset, **fields)['results']
+
+    def detail(self, detail_name, **kwargs):
+        """
+        Fetch a detail view of the object by name, for example 'interfaces' on
+        a Device object. This would translate to a GET on
+        devices/:id/interfaces/
+
+        Any kwargs passed to this method will get passed along to the detail
+        view as query parameters.
+
+        Only supports GET operations right now. Whatever the API endpoint
+        returns is what this method returns, since the return values may vary
+        from endpoint to endpoint.
+
+        For example, if you are fetching interfaces from a device, you may want
+        to do something like this::
+
+            >>> [models.Interface(i) for i in device.detail('interfaces')]
+
+        :param detail_name:
+            The name of the detail view, the ":detail" in
+            /api/sites/1/:resource/:id/:detail
+
+        :returns:
+            The result of the HTTP GET, which may vary between endpoints
+        """
+        pk = self.obj.get('id')
+        if pk is None:
+            existing = self.existing_object()
+            if existing is not None:
+                pk = existing.get('id')
+
+        if not pk:
+            raise DoesNotExist
+
+        resource = getattr(self.resource(pk), detail_name)
+        return self._call_method(resource, 'get', **kwargs)
+
+    @classmethod
+    def create(cls, **kwargs):
+        payload = filter_none(kwargs)
+        payload.pop('id', None)  # Ditch id explicitly
+
+        self = cls()
+        new_obj = self._call_method(self.resource, 'post', payload)
+
+        return new_obj
+
+    def update(self, overwrite=False, **kwargs):
+        payload = filter_none(kwargs)
+        orig = self.existing_object()
+        if not overwrite:
+            # We don't use PATCH at all since it doesn't work well. Instead
+            # merge our stored object onto the original and PUT that
+            # whole enchilada
+            payload = deep_merge(orig.obj, payload)
+
+        pk = orig.obj['id']
+
+        # Only PUT the object if it differs from the original
+        if payload != orig.obj:
+            new_obj = self._call_method(self.resource(pk), 'put', payload)
         else:
-            cur = dict(self)
-            cur.pop('attributes', None)
-            # We pop attributes because the query fails leaving them in
+            new_obj = payload
+
+        # Store the saved object to make sure we're in-sync
+        for k, v in new_obj.iteritems():
+            if k in self.fields:
+                self.obj[k] = v
+
+        return self.obj
+
+    def save(self, overwrite=False):
+        """
+        Create or update this resource object. If it doesn't already exist, do
+        a POST, if it does, do a PUT or a PATCH depending on whether we're told
+        to overwrite the object
+        """
+        # Leave it up to .create() or .update() to filter None themselves.
+        payload = self.obj
+
+        orig = self.existing_object()
+        if orig is None:
+            new_obj = self.create(**payload)
+        else:
+            new_obj = self.update(overwrite=overwrite, **payload)
+
+        # Store the saved object to make sure we're in-sync
+        for k, v in new_obj.iteritems():
+            if k in self.fields:
+                self.obj[k] = v
+
+        return self.obj
+
+    def delete(self, **kwargs):
+        pk = self.obj.get('id', self.existing_object()['id'])
+
+        self._call_method(self.resource(pk), 'delete', **kwargs)
+        self.initialize_object(obj={})
+
+    def existing_object(self):
+        """
+        Try really hard to get the existing object. First by GETing the object
+        by the unique ID if set on this Resource object, then by doing a
+        filter() on this object's field values.
+
+        :returns:
+            A Resource model object representing the existing object, or None
+            if the object doesn't exist
+        """
+        obj = None
+
+        if self.obj.get('id', 0):
             try:
-                # Site client of resource type because NSoT doesn't support
-                # passing site_id as a query parameter
-                site = getattr(
-                    self.client.sites(self['site_id']),
-                    self.resource_name,
-                )
-                lookup = get_result(site.get(**cur))
-            except Exception as e:
-                self.log_error(e)
-                # There might be a better way to do this. If the NSoT server is
-                # unreachable or otherwise the lookup fails it'll log properly
-                # and return as if nothing exists. If the resource actually
-                # exists but due to reachability it couldn't confirm some
-                # action may be unnecessarily took user-side.
-                #
-                # Honestly, though, I think this is a decent trade-off
-                self._existing_resource = {}
-                return self._existing_resource
+                obj = self.get(self.obj['id'])
+            except HttpClientError as e:
+                if e.resonse.status_code != 404:
+                    # If this is anything besides a 404, let it bubble up
+                    raise e
+        else:
+            try:
+                obj = self.filter(**self.obj).next()
+            except StopIteration:
+                obj = None
 
-            existing = len(lookup) > 0
-            if existing:
-                # This is where state will be kept for this
-                self._existing_resource = lookup[0]
-                return self._existing_resource
-            else:
-                self._existing_resource = {}
-                return self._existing_resource
-
-    def clear_cache(self):
-        '''Clears state of certain properties
-
-        This is ideally done during a write operation against the API, such as
-        ``.purge()`` or ``.ensure()``. Helps prevent representing out-of-date
-        information
-        '''
-        self._existing_resource = {}
+        return obj
 
     def exists(self):
-        '''Does the current resource exist?
-
-        :rtype: bool
-        '''
-        return bool(self.existing_resource())
-
-    def ensure(self):
-        '''Ensure object in current state exists in NSoT
-
-        By site, make sure resource exists. True if it is or was able to get to
-        the desired state, False if not and logged in ``last_error``.
-
-        Having this operation be done individually for each resource
-        has some pros and cons. Generally as long as the amount of items
-        is small enough, it's not a huge difference but it is an extra
-        HTTP request.
-
-        Sending in bulk halts at the first error and fails the following
-        so it requires more handling.
-
-        Cache is cleared first thing and before return.
-
-        :rtype: bool
-        '''
-        self.clear_cache()
-        to_ensure = dict(self)
-
-        try:
-            # PATCH instead of POST
-            if self.exists() and self.resource_name != 'interfaces':
-                self.logger.debug('[%s] Patching', self.identifier)
-                to_ensure['id'] = self.existing_resource()['id']
-                self.resource.patch([to_ensure])
-                self.logger.info('[%s] has been patched!', self.identifier)
-                self.clear_cache()
-                return True
-
-            else:  # POST for initially creating
-                self.logger.debug('[%s] Creating', self.identifier)
-                self.resource.post([to_ensure])
-                self.logger.info('[%s] has been created!', self.identifier)
-                return True
-        except Exception as e:
-            self.log_error(e)
-            self.clear_cache()
-            return False
-
-    def purge(self):
-        '''Ensure resource doesn't exist upstream
-
-        By site, make sure resource is deleted. True if it is or was able to
-        get to the desired state, False if not and logged in ``last_error``.
-
-        Cache is cleared first thing and before return.
-
-        :rtype: bool
-        '''
-        self.clear_cache()
-        try:
-            if self.exists():
-                self.logger.debug('[%s] Deleting', self.identifier)
-                id_ = self.existing_resource()['id']
-                self.resource(id_).delete()
-                self.logger.info('[%s] has been deleted!', self.identifier)
-                self.clear_cache()
-                return True
-
-            else:
-                # We should return True to show the state is already how we
-                # want it to be. False should be for unable to ensure resource
-                # is gone
-                return True
-        except Exception as e:
-            self.log_error(e)
-            self.clear_cache()
-            return False
+        """
+        Returns True if the object exists in NSoT, False otherwise.
+        """
+        return self.existing_object() is not None
 
 
-class Network(Resource):
-    '''Network API Abstraction Model
+# THIS IS NOT WORKING YET
+class ResourceList(collections.MutableSequence):
+    """A list of Resource objects that supports bulk operations."""
+    def __init__(self, objects, **kwargs):
+        self.objects = objects
 
-    Subclass of Resource.
+    def __iter__(self):
+        return self.objects.next()
 
-    >>> n = Network(cidr='8.8.8.0/24', site_id=1)
-    >>> n.exists()
-    False
-    >>> n.ensure()
-    True
-    >>> n.exists()
-    True
-    >>> n.existing_resource()
-    {u'attributes': {},
-     u'id': 31,
-     u'ip_version': u'4',
-     u'is_ip': True,
-     u'network_address': u'8.8.8.0',
-     u'parent_id': 1,
-     u'prefix_length': 24,
-     u'site_id': 1,
-     u'state': u'assigned'}
-    >>>
-    >>> n.purge()
-    True
-    >>> n.exists()
-    False
-    >>> n.closest_parent()
-    <Network: 8.8.0.0/16>
+    @classmethod
+    def filter(cls, **fields):
+        pass
 
-    :param cidr: CIDR for network
-    '''
+    @classmethod
+    def get(cls, pk):
+        pass
 
-    def postinit(self, cidr=None):
-        if not any([cidr, self.raw]):
-            raise TypeError('Networks require a cidr')
-        net = IPNetwork(cidr)
+    def update(self, overwrite=False, **kwargs):
+        pass
 
-        ver = net.version
-        self.network_address = str(net.network)
-        self.prefix_length = int(net.prefixlen)
-        self.is_host = ver == 4 and net.prefixlen == 32 or net.prefixlen == 128
-        self.init_payload()
+    def delete(self, **kwargs):
+        pass
 
-    @property
-    def identifier(self):
-        return '%s/%d' % (self['network_address'], self['prefix_length'])
-
-    @property
-    def resource_name(self):
-        return 'networks'
-
-    def init_payload(self):
-        '''This will init the payload property'''
-        if self.raw:
-            self.payload = self.raw
-            return
-
-        self.payload = {
-            'is_ip': self.is_host,
-            'network_address': self.network_address,
-            'prefix_length': self.prefix_length,
-            'state': self.is_host and 'assigned' or 'allocated',
-            'site_id': self._site_id,
-            'attributes': self.attributes,
-        }
-
-    def closest_parent(self):
-        '''Returns resource object of the closest parent network
-
-        Empty dictionary if no parent network
-
-        :returns: Parent resource
-        :rtype: pynsot.models.Network or dict
-        '''
-        self.ensure_client()
-        site = getattr(self.client.sites(self['site_id']), self.resource_name)
-        cidr = '%s/%s' % (self['network_address'], self['prefix_length'])
-        try:
-            lookup = get_result(site(cidr).closest_parent.get())
-            return Network(raw=lookup)
-        except Exception as e:
-            self.log_error(e)
-            return {}
-
-    def __len__(self):
-        return self['prefix_length']
+    def exists(self):
+        return all(o.existing_object() for o in self.objects)
 
 
-class Device(Resource):
-    '''Device Resource
+# NYI - Exclude these for now.
+EXCLUDE_FROM_SCHEMA = ['authenticate', 'sites', 'users', 'values']
 
-    Subclass of Resource.
+# Used to represent data used to create Resource subclasses dynamically within a
+# ModelClient instance.
+ModelSchema = collections.namedtuple(
+    'ModelSchema', ['resource_name', 'natural_key', 'fields']
+)
 
-    >>> dev = Device(hostname='router1-nyc', site_id=1)
-    >>> dev.exists()
-    False
-    >>>
-    >>> dev.ensure()
-    True
-    >>>
-    >>> dev.existing_resource()
-    {u'attributes': {}, u'hostname': u'router1-nyc', u'id': 1, u'site_id': 1}
-    >>> dev.purge()
-    True
-    >>>
-    >>> dev.exists()
-    False
+# Definitions of each API resource for use in generating subclasses.
+MODEL_SCHEMAS = [
+    ModelSchema(
+        resource_name='attributes',
+        natural_key='id',
+        fields=[
+            'id',
+            'constraints',
+            'description',
+            'display',
+            'multi',
+            'name',
+            'required',
+            'resource_name',
+        ]
+    ),
+    ModelSchema(
+        resource_name='devices',
+        natural_key='hostname',
+        fields=['id', 'attributes', 'hostname']
+    ),
+    ModelSchema(
+        resource_name = 'interfaces',
+        natural_key = 'name_slug',
+        fields = [
+            'id',
+            'addresses',
+            'attributes',
+            'description',
+            'device',
+            'mac_address',
+            'name',
+            'parent',
+            'speed',
+            'type',
 
-    :param hostname: Device hostname
-    '''
+            # Read-only fields
+            'device_hostname',
+            'name_slug',
+            'networks',
+            'parent_id',
+        ]
+    ),
+    ModelSchema(
+        resource_name = 'circuits',
+        natural_key = 'name_slug',
+        fields = [
+            'id',
+            'attributes',
+            'endpoint_a',
+            'endpoint_z',
+            'name',
 
-    def postinit(self, hostname=None):
-        if not any([hostname, self.raw]):
-            raise TypeError('Devices require a hostname')
-        self.hostname = hostname
-        self.init_payload()
+            # Read-only fields
+            'name_slug',
+        ]
+    ),
+    ModelSchema(
+        resource_name = 'networks',
+        natural_key = 'cidr',
+        fields = [
+            'id',
+            'attributes',
+            'cidr',
+            'network_address',
+            'prefix_length',
+            'state',
 
-    @property
-    def identifier(self):
-        return self.hostname
+            # Read-only fields
+            'ip_version',
+            'is_ip',
+            'parent',
+            'parent_id',
+        ]
+    ),
+    ModelSchema(
+        resource_name = 'protocols',
+        natural_key = 'id',
+        fields = [
+            'id',
+            'attributes',
+            'auth_string',
+            'circuit',
+            'description',
+            'device',
+            'interface',
+            'type',
+        ]
+    ),
+    ModelSchema(
+        resource_name = 'protocol_types',
+        natural_key = 'name',
+        fields = [
+            'id',
+            'description',
+            'name',
+            'required_attributes',
+        ]
+    ),
+]
 
-    @property
-    def resource_name(self):
-        return 'devices'
 
-    def init_payload(self):
-        if self.raw:
-            self.payload = self.raw
-            return
+class ModelClient(object):
+    """Special client that calls NSoT underneath but emits classes."""
+    def __init__(self, nsot_client=None, **client_kwargs):
+        # If a nsot client is passed in, use that. Otherwise get one!
+        if nsot_client is None:
+            raw_client = get_api_client(**client_kwargs)
+            nsot_client = raw_client.sites(raw_client.default_site)
 
-        self.payload = {
-            'hostname': self.hostname,
-            'site_id': self._site_id,
-            'attributes': self.attributes,
-        }
+        self.nsot_client = nsot_client
 
+        # Store the generated model classes on the client instance in case we
+        # need to reference them. We need to do this because
+        # ``Resource.__subclasses__()`` will have duplicate classes for each time
+        # ModelClient is instantiated.
+        self.model_classes = []
 
-class Interface(Resource):
-    '''Interface Resource
+        # Generate the resource model classes
+        self.generate_models()
 
-    Subclass of Resource
+    # NYI
+    def get_schema(self, nsot_client=None):
+        if nsot_client is None:
+            nsot_client = self.nsot_client
 
-    :param addresses: Addresses on interface
-    :type addresses: list
-    :param description: Interface description
-    :param device: Required, device interface is on. TODO: broken as currently
-        implemented but will soon reflect the following type
-    :type device: pynsot.models.Device
-    :param type: Interface type as described by SNMP IF-TYPE's
-    :type type: int
-    :param mac_address: MAC of interface
-    :param name: Required, name of interface
-    :param parent_id: ID of parent interface
-    :type parent_id: int
-    :param speed: Speed of interface
-    :type speed: int
-    '''
+        api_url = nsot_client._store['base_url']
+        url = urlparse.urlsplit(api_url)
 
-    def postinit(self, **kwargs):
-        self.addresses = kwargs.get('addresses') or []
-        self.description = kwargs.get('description') or ''
-        self.device = kwargs.get('device') or 0
-        self._original_device = kwargs.get('device') or None
-        self.type = kwargs.get('type') or 6
-        self.mac_address = kwargs.get('mac_address') or '00:00:00:00:00:00'
-        self.name = kwargs.get('name') or None
-        self.parent_id = kwargs.get('parent_id') or None
-        self.speed = kwargs.get('speed') or 1000
+        schema_url = '{}://{}/schema/'.format(url.scheme, url.netloc)
+        schema_client = coreapi.Client()
+        schema = schema_client.get(schema_url, format='openapi')
 
-        if not all([self.name, self.device]) or self.raw:
-            raise TypeError('Interfaces require both a name and device!')
+        return schema
 
-        self.attempt_device()
-        self.init_payload()
+    def normalize_resource_name(self, resource_name):
+        """
+        Normalize a model's resource_name to a suitable class name.
 
-    def attempt_device(self):
-        '''Attempt to set ``device`` attribute to its ID if hostname was given
+        Example::
 
-        If an ID was provided during init, this happens in init. If a hostname
-        was provided, we need to take care of a couple things.
+            >>> models.generate_class_name('protocol_types')
+            'ProtocolType'
 
-        1. Attempt to fetch ID for existing device by the hostname. If this
-           works, use this ID
+        :parma resource_name:
+            Plural model resource name
 
-        2. Should #1 fail, set device id to 0 to signify this device doesn't
-           exist yet, hoping this method will be called again when it's time to
-           create. The thought here is if a user is instantiating lots of
-           resources at the same time, there's a chance the device this relates
-           to is going to be created before this one actually gets called upon.
+        :returns:
+            str
+        """
+        name = resource_name[:-1].title()  # foos -> Foo
+        name = name.replace('_', '') # Foo_Bar -> FooBar
+        return bytes(name)
 
-           0 is used instead of a more descriptive message because should the
-           device still not exist when executing this, at least a device
-           doesn't exist error would be returned instead of expecting int not
-           str.
-        '''
+    def generate_models(self):
+        """Walk thru MODEL_SCHEMAS and generate resource classes."""
+        bases = (Resource,)
 
-        rerun = isinstance(self._original_device, str) and self.device == 0
-        first_run = isinstance(self.device, str)
-        # If equal to 0, means it had failed before
-        if rerun or first_run:
-            d = Device(
-                client=self.client,
-                site_id=self._site_id,
-                hostname=self._original_device,
+        # For each model schema, generate a Resource subclass and attach it to
+        # the instance as an attribute (e.g. ``models.Device``).
+        for mschema in MODEL_SCHEMAS:
+            name = self.normalize_resource_name(mschema.resource_name)
+            dict_ = dict(
+                nsot_client=self.nsot_client,
+                **mschema._asdict()
             )
-            if d.exists():
-                self.device = d.existing_resource()['id']
-                return True
-            else:
-                self.device = 0
-                return False
+            cls = type(name, bases, dict_)  # e.g. ``class Foo``
+            setattr(self, name, cls)  # e.g. ``self.Foo = Foo``
+            self.model_classes.append(cls)
 
-    @property
-    def identifier(self):
-        return '%s on %s' % (self.name, self.device)
 
-    @property
-    def resource_name(self):
-        return 'interfaces'
+'''
+    def _generate_models(self):
+        """Auto-generate each resource class."""
+        Resource = type(
+            'Resource', (_ResourceMeta,), {'nsot_client': self.nsot_client}
+        )
 
-    def init_payload(self):
-        if self.raw:
-            self.payload = self.raw
-            return
+        class Attribute(Resource):
+            resource_name = 'attributes'
+            natural_key = 'id'
+            fields = [
+                'id',
+                'constraints',
+                'description',
+                'display',
+                'multi',
+                'name',
+                'required',
+                'resource_name',
+            ]
 
-        # TODO: This currently will only work on init and not later since
-        # init_payload is only called once. This is left over from when it was
-        # just payload
-        #
-        # attempt_device should instead set self.payload['device'] directly
-        self.attempt_device()
-        self.payload = {
-            'addresses': self.addresses,
-            'description': self.description,
-            'device': self.device,
-            'type': self.type,
-            'mac_address': self.mac_address,
-            'name': self.name,
-            'parent_id': self.parent_id,
-            'speed': self.speed,
-            'attributes': self.attributes,
-            'site_id': self._site_id,
-        }
+        class Device(Resource):
+            resource_name = 'devices'
+            natural_key = 'hostname'
+            fields = [
+                'id',
+                'attributes',
+                'hostname',
+            ]
+
+        class Interface(Resource):
+            resource_name = 'interfaces'
+            natural_key = 'name_slug'
+            fields = [
+                'id',
+                'addresses',
+                'attributes',
+                'description',
+                'device',
+                'mac_address',
+                'name',
+                'parent',
+                'speed',
+                'type',
+
+                # Read-only fields
+                'device_hostname',
+                'name_slug',
+                'networks',
+                'parent_id',
+            ]
+
+        class Circuit(Resource):
+            resource_name = 'circuits'
+            natural_key = 'name_slug'
+            fields = [
+                'id',
+                'attributes',
+                'endpoint_a',
+                'endpoint_z',
+                'name',
+
+                # Read-only fields
+                'name_slug',
+            ]
+
+        class Network(Resource):
+            resource_name = 'networks'
+            natural_key = 'cidr'
+            fields = [
+                'id',
+                'attributes',
+                'cidr',
+                'network_address',
+                'prefix_length',
+                'state',
+
+                # Read-only fields
+                'ip_version',
+                'is_ip',
+                'parent',
+                'parent_id',
+            ]
+
+        class Protocol(Resource):
+            resource_name = 'protocols'
+            natural_key = 'id'
+            fields = [
+                'id',
+                'attributes',
+                'auth_string',
+                'circuit',
+                'description',
+                'device',
+                'interface',
+                'type',
+            ]
+
+        class ProtocolType(Resource):
+            resource_name = 'protocol_types'
+            natural_key = 'name'
+            fields = [
+                'id',
+                'description',
+                'name',
+                'required_attributes',
+            ]
+
+        for cls in (Attribute, Device, Interface, Circuit, Network, Protocol,
+                    ProtocolType):
+            setattr(self, cls.__name__, cls)
+
+    # Individual resource classes for people to use
+    class Attribute(Resource):
+        resource_name = 'attributes'
+        natural_key = 'id'
+        fields = [
+            'id',
+            'constraints',
+            'description',
+            'display',
+            'multi',
+            'name',
+            'required',
+            'resource_name',
+        ]
+
+    class Device(Resource):
+        resource_name = 'devices'
+        natural_key = 'hostname'
+        fields = [
+            'id',
+            'attributes',
+            'hostname',
+        ]
+
+    class Interface(Resource):
+        resource_name = 'interfaces'
+        natural_key = 'name_slug'
+        fields = [
+            'id',
+            'addresses',
+            'attributes',
+            'description',
+            'device',
+            'mac_address',
+            'name',
+            'parent',
+            'speed',
+            'type',
+
+            # Read-only fields
+            'device_hostname',
+            'name_slug',
+            'networks',
+            'parent_id',
+        ]
+
+    class Circuit(Resource):
+        resource_name = 'circuits'
+        natural_key = 'name_slug'
+        fields = [
+            'id',
+            'attributes',
+            'endpoint_a',
+            'endpoint_z',
+            'name',
+
+            # Read-only fields
+            'name_slug',
+        ]
+
+    class Network(Resource):
+        resource_name = 'networks'
+        natural_key = 'cidr'
+        fields = [
+            'id',
+            'attributes',
+            'cidr',
+            'network_address',
+            'prefix_length',
+            'state',
+
+            # Read-only fields
+            'ip_version',
+            'is_ip',
+            'parent',
+            'parent_id',
+        ]
+
+    class Protocol(Resource):
+        resource_name = 'protocols'
+        natural_key = 'id'
+        fields = [
+            'id',
+            'attributes',
+            'auth_string',
+            'circuit',
+            'description',
+            'device',
+            'interface',
+            'type',
+        ]
+
+    class ProtocolType(Resource):
+        resource_name = 'protocol_types'
+        natural_key = 'name'
+        fields = [
+            'id',
+            'description',
+            'name',
+            'required_attributes',
+        ]
+'''

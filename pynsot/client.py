@@ -82,40 +82,9 @@ class BaseClient(slumber.API):
         self._auth = auth
         self._headers = self._store['session'].headers
 
-    def _fetch_resources(self):
-        """Fetch resources from API"""
-        headers = self._headers
-        auth = self._auth
-        api_root = self._base_url + '/'
-        r = slumber.requests.get(api_root, auth=auth, headers=headers)
-
-        if r.ok:
-            return r.json()
-        else:
-            msg = r.json().get(
-                'error', 'Error fetching API resources. Is auth OK?'
-            )
-            raise ClientError(msg)
-
-    def _populate_resources(self, resources=None):
-        """
-        Use `resources` to populate ... resources.
-
-        :param resources:
-            A list or dict containing resource names
-        """
-        if resources is None:
-            raise TypeError('Resources must be iterable')
-
-        # Iterate the resource names, and set a local attribute name using the
-        # resource method we retrieved from the API.
-        for resource_name in resources:
-            resource = getattr(self, resource_name)
-            setattr(self, resource_name, resource)
-
     def get_auth(self, **kwargs):
         """
-        Subclasses should references kwargs from ``self._kwargs``.
+        Subclasses should reference kwargs from ``self._kwargs``.
 
         :param client:
             Client instance. Defaults to ``self``.
